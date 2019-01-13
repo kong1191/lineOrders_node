@@ -9,6 +9,7 @@
     "test": "mocha"
   },
   "dependencies": {
+    "await-semaphore": "^0.1.3",
     "express": "^4.16.4",
     "googleapis": "^36.0.0",
     "linebot": "^1.4.1",

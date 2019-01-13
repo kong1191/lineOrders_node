@@ -1,3 +1,5 @@
+const semaphore = require('await-semaphore');
+
 const express = require('express');
 const linebot = require('linebot');
 const {google} = require('googleapis');
@@ -7,6 +9,7 @@ const path = require('path');
 const request = require('request-promise');
 const winston = require('winston');
 var app = module.exports = express();
+
 
 // Console transport for winton.
 const consoleTransport = new winston.transports.Console();
@@ -118,71 +121,87 @@ app.post('/album/:title', async(req, res) => {
     }
 });
 
-app.post('/upload/:filename', async(req, res) => {
+app.post('/uploadAll', async(req, res) => {
     const token = await get_access_token();
 
-    const file_name = req.params.filename;
-    const file_path = path.join(download_path, file_name);
-    if (!fs.existsSync(file_path)) {
-        res.status(500).send({name: 'File operation error', message: "File does not existed"});
-        return;
-    }
+    var files = fs.readdirSync(download_path);
 
-    var item = {
-        "name": file_name,
-        "stream": fs.createReadStream(file_path)
-    };
+    var fail_count = 0;
 
-    const error = await upload_media_item(token, default_album_id, item);
-    if (error) {
-      res.status(500).send(error);
-    } else {
-      res.status(200).send('Upload media item success');
-    }
+    // Parallel upload:
+    await Promise.all(files.map(async (file) => {
+        var item = {
+            "name": file,
+            "stream": fs.createReadStream(path.join(download_path, file))
+        };
+
+        var error = await upload_media_item(token, default_album_id, item);
+        if (error) {
+            // retry
+            await sleep_random(10, 30);
+            error = await upload_media_item(token, default_album_id, item);
+            if (error) {
+                fail_count++;
+            }
+        }
+    }));
+
+    // Sequencial upload:
+    // for (const file of files) {
+    //     var item = {
+    //         "name": file,
+    //         "stream": fs.createReadStream(path.join(download_path, file))
+    //     };
+    //     logger.error(`start uploading file: ${file}`);
+    //     const error = await upload_media_item(token, default_album_id, item);
+    //     if (error) {
+    //       logger.error('Failed to upload media item', error);
+    //       fail_count++;
+    //     }
+    // };
+
+    logger.info(`Upload media item test done, total files: ${files.length}, failed: ${fail_count}`);
+    res.status(200).send(`Upload media item test done, total files: ${files.length}, failed: ${fail_count}`);
 });
 
 async function create_shared_album(token, title) {
     let error = null;
+    let result = null;
 
-    var result = await request.post('https://photoslibrary.googleapis.com/v1/albums', {
-      headers: {'Content-Type': 'application/json'},
-      json: true,
-      auth: {'bearer': token},
-      body: {
-        "album": {
-          "title": title
-        }
-      }
-    }).catch(function (err) {
-        error = {name: err.name, message: err.message};
-        logger.error('Failed to create new album', error);
-    });
-
-    if (error !== null) {
-        return error;
-    }
-
-    logger.debug('Response of creating album:', result);
-    album_id = result.id;
-
-    result = await request.post(`https://photoslibrary.googleapis.com/v1/albums/${album_id}:share`, {
-        headers: {'Content-Type': 'application/json'},
-        json: true,
-        auth: {'bearer': token},
-        body: {
-            "sharedAlbumOptions": {
-              "isCollaborative": true,
-              "isCommentable": true
+    try {
+        result = await request.post('https://photoslibrary.googleapis.com/v1/albums', {
+            headers: {'Content-Type': 'application/json'},
+            json: true,
+            auth: {'bearer': token},
+            body: {
+              "album": {
+                "title": title
+              }
             }
-        }
-    }).catch(function (err) {
-        error = {name: err.name, message: err.message};
-        logger.error('Failed to share new album', error);
-    });
+        });
 
-    if (error === null) {
+        result = await request.post(`https://photoslibrary.googleapis.com/v1/albums/${result.id}:share`, {
+            headers: {'Content-Type': 'application/json'},
+            json: true,
+            auth: {'bearer': token},
+            body: {
+                "sharedAlbumOptions": {
+                  "isCollaborative": true,
+                  "isCommentable": true
+                }
+            }
+        });
+
         logger.debug('Response of sharing album:', result);
+    } catch(err) {
+        if (err.error.error) {
+            error = {"code": err.error.error.code, "message": err.error.error.status};
+        } else {
+            error = {"name": err.name, "message": err.message};
+        }
+        logger.error(`Failed to create shared album`, error);
     }
+
     return error;
 }
 
@@ -197,91 +216,94 @@ async function get_shared_albums(authToken) {
       excludeNonAppCreatedData: false
     };
 
-    // Loop while there is a nextpageToken property in the response until all
-    // albums have been listed.
-    do {
-        logger.debug(`Loading shared albums. Received so far: ${albums.length}`);
-        // Make a GET request to load the albums with optional parameters (the
-        // pageToken if set).
-        const result = await request.get('https://photoslibrary.googleapis.com/v1/sharedAlbums', {
-            headers: {'Content-Type': 'application/json'},
-            qs: parameters,
-            json: true,
-            auth: {'bearer': authToken},
-        }).catch(function (err) {
-            error = {name: err.name, message: err.message};
-            logger.error('Failed to get album list', error);
-        });
+    try {
+        // Loop while there is a nextpageToken property in the response until all
+        // albums have been listed.
+        do {
+            logger.debug(`Loading shared albums. Received so far: ${albums.length}`);
+            // Make a GET request to load the albums with optional parameters (the
+            // pageToken if set).
+            const result = await request.get('https://photoslibrary.googleapis.com/v1/sharedAlbums', {
+                headers: {'Content-Type': 'application/json'},
+                qs: parameters,
+                json: true,
+                auth: {'bearer': authToken},
+            });
 
-        if (error !== null) {
-            return {albums, error};
-        }
+            logger.debug('Response:', result);
 
-        logger.debug('Response:', result);
+            if (result && result.sharedAlbums) {
+                logger.debug(`Number of albums received: ${result.sharedAlbums.length}`);
+                // Parse albums and add them to the list, skipping empty entries.
+                const items = result.sharedAlbums.filter(x => !!x);
 
-        if (result && result.sharedAlbums) {
-            logger.debug(`Number of albums received: ${result.sharedAlbums.length}`);
-            // Parse albums and add them to the list, skipping empty entries.
-            const items = result.sharedAlbums.filter(x => !!x);
+                albums = albums.concat(items);
+            }
+            parameters.pageToken = result.nextPageToken;
+            // Loop until all albums have been listed and no new nextPageToken is
+            // returned.
+        } while (parameters.pageToken);
 
-            albums = albums.concat(items);
-        }
-        parameters.pageToken = result.nextPageToken;
-        // Loop until all albums have been listed and no new nextPageToken is
-        // returned.
-    } while (parameters.pageToken);
+        logger.info('Albums loaded.');
+    } catch (err) {
+        error = {name: err.name, message: err.message};
+        logger.error(`Failed to get album list: ${error.message}`);
+    }
 
-    logger.info('Albums loaded.');
     return {albums, error};
 }
 
+var sem_lock = new semaphore.Semaphore(1); // Sequencial upload
+
 async function upload_media_item(token, album_id, item) {
     let error = null;
+    let upload_token = "";
 
-    var result = await request.post('https://photoslibrary.googleapis.com/v1/uploads', {
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'X-Goog-Upload-File-Name': item.name,
-        'X-Goog-Upload-Protocol': 'raw'
-      },
-      json: false,
-      auth: {'bearer': token},
-      body: item.stream
-    }).catch(function (err) {
-        error = {name: err.name, message: err.message};
-        logger.error('Failed to upload media item', error);
-    });
+    var release = await sem_lock.acquire();
+    try {
+        logger.debug(`start uploading file: ${item.name}`);
 
-    if (error !== null) {
-        return error;
-    }
+        await sleep_random(1,5); // add delay to avoid that Google complains abuse the service
 
-    logger.debug('Response of uploading media item:', result);
-    var upload_token = result;
+        upload_token = await request.post('https://photoslibrary.googleapis.com/v1/uploads', {
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'X-Goog-Upload-File-Name': item.name,
+              'X-Goog-Upload-Protocol': 'raw'
+            },
+            json: false,
+            auth: {'bearer': token},
+            body: item.stream
+          });
 
-    result = await request.post(`https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate`, {
-        headers: {'Content-Type': 'application/json'},
-        json: true,
-        auth: {'bearer': token},
-        body: {
-            "albumId": album_id,
-            "newMediaItems": [
-              {
-                "description": "",
-                "simpleMediaItem": {
-                  "uploadToken": upload_token
-                }
-              }
-            ]
+        await sleep_random(1,5); // add delay to avoid that Google complains abuse the service
+
+        var result = await request.post(`https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate`, {
+            headers: {'Content-Type': 'application/json'},
+            json: true,
+            auth: {'bearer': token},
+            body: {
+                "albumId": album_id,
+                "newMediaItems": [
+                    {
+                        "description": "",
+                        "simpleMediaItem": {
+                            "uploadToken": upload_token
+                        }
+                    }
+                ]
+            }
+        });
+    } catch(err) {
+        if (err.error.error) {
+            error = {"item": item.name, "code": err.error.error.code, "message": err.error.error.status};
+        } else {
+            error = {"item": item.name, "name": err.name, "message": err.message};
         }
-    }).catch(function (err) {
-        error = {name: err.name, message: err.message};
-        logger.error('Failed to add media item to album', error);
-    });
-
-    if (error === null) {
-        logger.debug('Response of creating media item:', result);
+        logger.error(`Failed to upload media item, item: ${item.name}, upload_token: ${upload_token}`);
     }
+
+    release();
     return error;
 }
 
@@ -363,6 +385,13 @@ function handle_text_message(text) {
     return null;
 }
 
+function sleep_random(min, max){
+    return new Promise(resolve => {
+        var seconds = Math.floor(Math.random() * (max-min)) + min;
+        setTimeout(resolve, seconds * 1000);
+    });
+}
+
 async function upload_to_google_photo(type, msg_id) {
     const buffer = await bot.getMessageContent(msg_id);
 
@@ -376,12 +405,18 @@ async function upload_to_google_photo(type, msg_id) {
     // Upload content to Google Photo
     // TODO(james): query album id from database according to group ID or room ID
     const token = await get_access_token();
-    const error = await upload_media_item(token, default_album_id, item);
-    if (error) {
-      logger.error('Failed to upload file to album', error);
-    } else {
-      logger.info(`Upload media item success: ${item.name}`);
-    }
+    var retry = 3;
+    do {
+        var error = await upload_media_item(token, default_album_id, item);
+        if (error) {
+            retry--;
+            await sleep_random(10, 30);
+            logger.error(`Failed to upload file to album, retry count left: ${retry}`, error);
+        } else {
+            logger.info(`Upload media item success: ${item.name}`);
+            break;
+        }
+    } while (retry > 0);
 }
 
 bot.on('message', function(event) {
