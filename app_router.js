@@ -5,13 +5,36 @@ const fs = require('fs');
 const streamifier = require('streamifier');
 const path = require('path');
 const request = require('request-promise');
+const winston = require('winston');
 var app = module.exports = express();
+
+// Console transport for winton.
+const consoleTransport = new winston.transports.Console();
+
+// Set up winston logging.
+const logger = winston.createLogger({
+  format: winston.format.combine(
+    winston.format.colorize(),
+    winston.format.simple()
+  ),
+  transports: [
+    consoleTransport
+  ]
+});
+
+// Log Levels:
+// error: 0, warn: 1, info: 2, verbose: 3, debug: 4, silly: 5
+if (process.env.LOG_LEVEL) {
+    logger.level = process.env.LOG_LEVEL;
+} else {
+    logger.level = 'warn';
+}
 
 const download_path = path.join(__dirname, 'download');
 fs.mkdir(download_path, function(err) {
     // Ignore file existed error
     if (err && err.errno != -17) {
-        console.error("Failed to creating download folder", err);
+        logger.error("Failed to creating download folder", err);
     }
 });
 
@@ -27,7 +50,7 @@ google_auth_client.setCredentials({
 
 async function get_access_token() {
     var tokens = await google_auth_client.getAccessToken();
-    console.debug("Get access token: ", tokens.token);
+    logger.debug("Get access token: ", tokens.token);
     return tokens.token;
 }
 
@@ -51,16 +74,16 @@ app.get('/auth/google', function(request, response) {
 
 app.get('/auth/google/callback', function(request, response) {
     if (request.query && request.query.error) {
-        console.error("Authentication failed", request.query.error);
+        logger.error("Authentication failed", request.query.error);
         response.send("Authentication Failed");
     } else {
         var code = request.query.code;
         google_auth_client.getToken(code, function(err, tokens) {
             if (err) {
-                console.error("Failed to get tokens from Authentication Server", err);
+                logger.error("Failed to get tokens from Authentication Server", err);
                 response.send("Failed to get tokens from Authentication Server");
             } else {
-                console.info("Get tokens", tokens);
+                logger.info("Get tokens", tokens);
 
                 google_auth_client.setCredentials(tokens);
                 response.send("Authentication Success!");
@@ -132,14 +155,14 @@ async function create_shared_album(token, title) {
       }
     }).catch(function (err) {
         error = {name: err.name, message: err.message};
-        console.log('Failed to create new album', error);
+        logger.error('Failed to create new album', error);
     });
 
     if (error !== null) {
         return error;
     }
 
-    console.debug('Response of creating album:', result);
+    logger.debug('Response of creating album:', result);
     album_id = result.id;
 
     result = await request.post(`https://photoslibrary.googleapis.com/v1/albums/${album_id}:share`, {
@@ -154,11 +177,11 @@ async function create_shared_album(token, title) {
         }
     }).catch(function (err) {
         error = {name: err.name, message: err.message};
-        console.log('Failed to share new album', error);
+        logger.error('Failed to share new album', error);
     });
 
     if (error === null) {
-        console.debug('Response of sharing album:', result);
+        logger.debug('Response of sharing album:', result);
     }
     return error;
 }
@@ -177,7 +200,7 @@ async function get_shared_albums(authToken) {
     // Loop while there is a nextpageToken property in the response until all
     // albums have been listed.
     do {
-        console.debug(`Loading shared albums. Received so far: ${albums.length}`);
+        logger.debug(`Loading shared albums. Received so far: ${albums.length}`);
         // Make a GET request to load the albums with optional parameters (the
         // pageToken if set).
         const result = await request.get('https://photoslibrary.googleapis.com/v1/sharedAlbums', {
@@ -187,17 +210,17 @@ async function get_shared_albums(authToken) {
             auth: {'bearer': authToken},
         }).catch(function (err) {
             error = {name: err.name, message: err.message};
-            console.log('Failed to get album list', error);
+            logger.error('Failed to get album list', error);
         });
 
         if (error !== null) {
             return {albums, error};
         }
 
-        console.debug('Response:', result);
+        logger.debug('Response:', result);
 
         if (result && result.sharedAlbums) {
-            console.debug(`Number of albums received: ${result.sharedAlbums.length}`);
+            logger.debug(`Number of albums received: ${result.sharedAlbums.length}`);
             // Parse albums and add them to the list, skipping empty entries.
             const items = result.sharedAlbums.filter(x => !!x);
 
@@ -208,7 +231,7 @@ async function get_shared_albums(authToken) {
         // returned.
     } while (parameters.pageToken);
 
-    console.info('Albums loaded.');
+    logger.info('Albums loaded.');
     return {albums, error};
 }
 
@@ -226,14 +249,14 @@ async function upload_media_item(token, album_id, item) {
       body: item.stream
     }).catch(function (err) {
         error = {name: err.name, message: err.message};
-        console.log('Failed to upload media item', error);
+        logger.error('Failed to upload media item', error);
     });
 
     if (error !== null) {
         return error;
     }
 
-    console.debug('Response of uploading media item:', result);
+    logger.debug('Response of uploading media item:', result);
     var upload_token = result;
 
     result = await request.post(`https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate`, {
@@ -253,11 +276,11 @@ async function upload_media_item(token, album_id, item) {
         }
     }).catch(function (err) {
         error = {name: err.name, message: err.message};
-        console.log('Failed to add media item to album', error);
+        logger.error('Failed to add media item to album', error);
     });
 
     if (error === null) {
-        console.debug('Response of creating media item:', result);
+        logger.debug('Response of creating media item:', result);
     }
     return error;
 }
@@ -277,9 +300,9 @@ const join_message = '謝謝邀請我加入群組，讓我有機會服務大家�
 
 bot.on('join', function(event) {
     event.reply(join_message).then(function(data) {
-        console.debug('Success to reply join event');
+        logger.debug('Success to reply join event');
     }).catch(function(error) {
-        console.error('Failed to reply join event', error);
+        logger.error('Failed to reply join event', error);
     });
 });
 
@@ -328,7 +351,7 @@ bot.on('postback', function(event) {
     } else if (event.postback.data === "disable_broadcast") {
         enable_broadcast = false;
     } else {
-        console.error('Unkown postback event data', event.postback);
+        logger.error('Unkown postback event data', event.postback);
     }
 });
 
@@ -348,16 +371,16 @@ async function upload_to_google_photo(type, msg_id) {
         "stream": streamifier.createReadStream(buffer)
     };
 
-    console.info('Start uploading content to Google Photo:', item.name);
+    logger.info('Start uploading content to Google Photo:', item.name);
 
     // Upload content to Google Photo
     // TODO(james): query album id from database according to group ID or room ID
     const token = await get_access_token();
     const error = await upload_media_item(token, default_album_id, item);
     if (error) {
-      console.error('Failed to upload file to album', error);
+      logger.error('Failed to upload file to album', error);
     } else {
-      console.info(`Upload media item success: ${item.name}`);
+      logger.info(`Upload media item success: ${item.name}`);
     }
 }
 
@@ -375,7 +398,7 @@ bot.on('message', function(event) {
             }
             break;
         default:
-            console.error('Unkown message type', event.message.type);
+            logger.error('Unkown message type', event.message.type);
     }
 
     if (reply_message === null) {
@@ -383,9 +406,9 @@ bot.on('message', function(event) {
     }
 
     event.reply(reply_message).then(function(data) {
-        console.debug('Success to reply message event');
+        logger.debug('Success to reply message event');
     }).catch(function(error) {
-        console.error('Failed to reply message event', error);
+        logger.error('Failed to reply message event', error);
     });
 });
 
