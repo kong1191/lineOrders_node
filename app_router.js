@@ -12,7 +12,9 @@ var app = module.exports = express();
 
 
 // Console transport for winton.
-const consoleTransport = new winston.transports.Console();
+const consoleTransport = new winston.transports.Console({
+    prettyPrint: JSON.stringify
+});
 
 // Set up winston logging.
 const logger = winston.createLogger({
@@ -53,7 +55,6 @@ google_auth_client.setCredentials({
 
 async function get_access_token() {
     var tokens = await google_auth_client.getAccessToken();
-    logger.debug("Get access token: ", tokens.token);
     return tokens.token;
 }
 
@@ -122,46 +123,19 @@ app.post('/album/:title', async(req, res) => {
 });
 
 app.post('/uploadAll', async(req, res) => {
-    const token = await get_access_token();
-
     var files = fs.readdirSync(download_path);
-
-    var fail_count = 0;
-
-    // Parallel upload:
-    await Promise.all(files.map(async (file) => {
+    for (const file of files) {
         var item = {
             "name": file,
+            "album_id": default_album_id,
             "stream": fs.createReadStream(path.join(download_path, file))
         };
 
-        var error = await upload_media_item(token, default_album_id, item);
-        if (error) {
-            // retry
-            await sleep_random(10, 30);
-            error = await upload_media_item(token, default_album_id, item);
-            if (error) {
-                fail_count++;
-            }
-        }
-    }));
+        enqueue_upload_item(item);
+    };
 
-    // Sequencial upload:
-    // for (const file of files) {
-    //     var item = {
-    //         "name": file,
-    //         "stream": fs.createReadStream(path.join(download_path, file))
-    //     };
-    //     logger.error(`start uploading file: ${file}`);
-    //     const error = await upload_media_item(token, default_album_id, item);
-    //     if (error) {
-    //       logger.error('Failed to upload media item', error);
-    //       fail_count++;
-    //     }
-    // };
-
-    logger.info(`Upload media item test done, total files: ${files.length}, failed: ${fail_count}`);
-    res.status(200).send(`Upload media item test done, total files: ${files.length}, failed: ${fail_count}`);
+    logger.info(`Upload media item test done`);
+    res.status(200).send(`Upload media item test done`);
 });
 
 async function create_shared_album(token, title) {
@@ -253,57 +227,219 @@ async function get_shared_albums(authToken) {
     return {albums, error};
 }
 
-var sem_lock = new semaphore.Semaphore(1); // Sequencial upload
+// max retry count for upload or download items
+var max_retry = 3;
 
-async function upload_media_item(token, album_id, item) {
+// upload_item format: {
+//     "name": ...,
+//     "album_id": ...,
+//     "stream": ...,
+//     "retry_count": ...,
+//     "token": ...
+// }
+var upload_item_list = []; // items to be upload to google
+var upload_item_history = []; //
+var history_index = 0;
+var max_history_entry = 100;
+
+function save_to_upload_history(upload_item, token) {
+    upload_item.token = token;
+    upload_item_history[history_index] = upload_item;
+    history_index = (history_index + 1) % max_history_entry;
+}
+
+function enqueue_upload_item(upload_item) {
+    if (!('retry_count' in upload_item)) {
+        upload_item.retry_count = 0;
+    }
+    upload_item_list.push(upload_item);
+}
+
+function dequeue_upload_item() {
+    return upload_item_list.shift();
+}
+
+// For 429 errors, the client may retry with minimum 30 s delay
+// reference: https://developers.google.com/photos/library/guides/best-practices
+const task_polling = 30; // seconds
+setInterval(upload_items, task_polling * 1000);
+
+const max_upload_items = 30; // max number of items handled by upload task per polling interval
+var in_progress_upload_items = 0;
+var mtx_lock = new semaphore.Semaphore(1); // execute only one task at a time(upload_item or add_item)
+
+async function upload_items() {
+    var i = 0;
+    var release = await mtx_lock.acquire();
+
+    do {
+        let item = dequeue_upload_item();
+        if (!item) {
+            break;
+        }
+        upload_media_item(item);
+        i++;
+        in_progress_upload_items++;
+    } while(i < max_upload_items);
+
+    while(in_progress_upload_items) {
+        await sleep(in_progress_upload_items * 1.5);
+    }
+
+    await add_items();
+
+    release();
+}
+
+// google allows add 50 items to a album in a REST API call
+const max_upload_tokens = 50;
+
+async function add_items() {
+    var album_list = Object.keys(upload_token_map);
+
+    for (const album_id of album_list) {
+        let num_tokens = upload_token_map[album_id].length;
+
+        if (num_tokens == 0) {
+            continue;
+        }
+        if (num_tokens > max_upload_tokens) {
+            num_tokens = max_upload_tokens;
+        }
+
+        let upload_token_list = upload_token_map[album_id].splice(0, num_tokens);
+        await add_item_to_album(album_id, upload_token_list);
+    };
+}
+
+function save_to_disk(item) {
+    logger.error(`Give up retry and save item to disk: ${item.name}`);
+
+    return new Promise((resolve, reject) => {
+        const writable = fs.createWriteStream(path.join(download_path, item.name));
+        item.stream.pipe(writable);
+        item.stream.on('end', () => resolve(item.name));
+        item.stream.on('error', reject);
+    });
+}
+
+// (key, value) = (album_id, upload_token_array)
+var upload_token_map = {}; // items to be added to album
+var sem_lock = new semaphore.Semaphore(5); // limit number of concurrent upload requests
+
+async function upload_media_item(upload_item) {
     let error = null;
-    let upload_token = "";
+    const access_token = await get_access_token();
 
     var release = await sem_lock.acquire();
     try {
-        logger.debug(`start uploading file: ${item.name}`);
-
-        await sleep_random(1,5); // add delay to avoid that Google complains abuse the service
-
-        upload_token = await request.post('https://photoslibrary.googleapis.com/v1/uploads', {
+        await sleep_random(3,5); // add delay to avoid that Google complains abuse the service
+        let upload_token = await request.post('https://photoslibrary.googleapis.com/v1/uploads', {
             headers: {
               'Content-Type': 'application/octet-stream',
-              'X-Goog-Upload-File-Name': item.name,
+              'X-Goog-Upload-File-Name': upload_item.name,
               'X-Goog-Upload-Protocol': 'raw'
             },
             json: false,
-            auth: {'bearer': token},
-            body: item.stream
-          });
-
-        await sleep_random(1,5); // add delay to avoid that Google complains abuse the service
-
-        var result = await request.post(`https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate`, {
-            headers: {'Content-Type': 'application/json'},
-            json: true,
-            auth: {'bearer': token},
-            body: {
-                "albumId": album_id,
-                "newMediaItems": [
-                    {
-                        "description": "",
-                        "simpleMediaItem": {
-                            "uploadToken": upload_token
-                        }
-                    }
-                ]
-            }
+            auth: {'bearer': access_token},
+            body: upload_item.stream
         });
-    } catch(err) {
-        if (err.error.error) {
-            error = {"item": item.name, "code": err.error.error.code, "message": err.error.error.status};
-        } else {
-            error = {"item": item.name, "name": err.name, "message": err.message};
+
+        let album_id = upload_item.album_id;
+
+        if (!(album_id in upload_token_map)) {
+            upload_token_map[album_id] = [];
         }
-        logger.error(`Failed to upload media item, item: ${item.name}, upload_token: ${upload_token}`);
+        upload_token_map[album_id].push(upload_token);
+
+        save_to_upload_history(upload_item, upload_token);
+
+        logger.info(`Upload media item success: ${upload_item.name}`);
+    } catch(err) {
+        if (upload_item.retry_count < max_retry) {
+            upload_item.retry_count++;
+            enqueue_upload_item(upload_item);
+        } else {
+            save_to_disk(upload_item).then((filename) => {
+                logger.info(`file saved to disk: ${filename}`);
+            });
+        }
+
+        if (err.error.error) {
+            error = {"code": err.error.error.code, "message": err.error.error.status};
+        } else {
+            error = {"name": err.name, "message": err.message};
+        }
+        logger.error(`Failed to upload media item: ${upload_item.name}`, error);
     }
 
     release();
+    in_progress_upload_items--;
+
+    return error;
+}
+
+async function add_item_to_album(album_id, upload_token_list) {
+    let error = null;
+    const access_token = await get_access_token();
+
+    try {
+        let media_items = [];
+        for (const token of upload_token_list) {
+            media_items.push({
+                "description": "",
+                "simpleMediaItem": {
+                    "uploadToken": token
+                }
+            });
+        }
+
+        logger.info(`start adding (${media_items.length}) items to album: ${album_id}`);
+
+        await sleep_random(3,5); // add delay to avoid that Google complains abuse the service
+        let result = await request.post(`https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate`, {
+            headers: {'Content-Type': 'application/json'},
+            json: true,
+            auth: {'bearer': access_token},
+            body: {
+                "albumId": album_id,
+                "newMediaItems": media_items
+            }
+        });
+
+        let status_codes = result["newMediaItemResults"].map(item => item.status.code);
+        let fail_count = 0;
+        let retry_items = 0;
+        let i = 0;
+        for (i = 0; i < status_codes.length; i++) {
+            // only retry the items with HTTP error: 5xx
+            // reference: https://github.com/googleapis/googleapis/blob/master/google/rpc/code.proto
+            if (status_codes[i] && status_codes[i] >= 13) {
+                upload_token_map[album_id].push(upload_token_list[i]);
+                retry_items++;
+            } else if (status_codes[i]) {
+                for (const item of upload_item_history) {
+                    if (item.token === upload_token_list[i]) {
+                        save_to_disk(item).then((filename) => {
+                            logger.info(`file saved to disk: ${filename}`);
+                        });;
+                    }
+                }
+                fail_count++;
+            }
+        }
+        logger.info(`total ${status_codes.length} items added, will retry: ${retry_items}, failed: ${fail_count}, status:`, status_codes);
+    } catch(err) {
+        upload_token_map[album_id] = upload_token_map[album_id].concat(upload_token_list); // add back to map for retry
+
+        if (err.error.error) {
+            error = {"code": err.error.error.code, "message": err.error.error.status};
+        } else {
+            error = {"name": err.name, "message": err.message};
+        }
+        logger.error(`Failed to add media items to album: ${album_id}`);
+    }
+
     return error;
 }
 
@@ -312,6 +448,117 @@ const bot = linebot({
     channelSecret: process.env.CHANNEL_SECRET,
     channelAccessToken: process.env.CHANNEL_TOKEN
 });
+
+
+function sleep_random(min, max){
+    return new Promise(resolve => {
+        var seconds = Math.floor(Math.random() * (max-min)) + min;
+        setTimeout(resolve, seconds * 1000);
+    });
+}
+
+function sleep(seconds){
+    return new Promise(resolve => {
+        setTimeout(resolve, seconds * 1000);
+    });
+}
+
+// content_msg = {
+//     "id": ...,
+//     "type": ...,
+//     "source": {
+//         "type": ...,
+//         "userId" | "groupId" | "roomId": ...
+//     },
+//     "retry_count": ...
+// };
+// reference: https://developers.line.biz/en/reference/messaging-api/#wh-image
+//            https://developers.line.biz/en/reference/messaging-api/#common-properties
+var content_msg_list = [];
+const max_download_items = 15; // max number of items handled by download task per polling interval
+
+function enqueue_content_msg(msg) {
+    if (!('retry_count' in msg)) {
+        msg.retry_count = 0;
+    }
+    content_msg_list.push(msg);
+}
+
+function dequeue_content_msg() {
+    return content_msg_list.shift();
+}
+
+setInterval(download_contents, task_polling * 1000);
+
+function download_contents() {
+    var i = 0;
+    do {
+        let content_msg = dequeue_content_msg();
+        if (!content_msg) {
+            break;
+        }
+
+        download_content(content_msg);
+        i++;
+    } while(i < max_download_items);
+}
+
+async function query_album_id(source) {
+    // TODO(james): query album id from database according to group ID or room ID
+    return default_album_id;
+}
+
+var download_lock = new semaphore.Semaphore(5); // limit concurrent downloads
+
+async function download_content(content_msg) {
+    var album_id = await query_album_id(content_msg.source);
+    var msg_type = content_msg.type;
+    var msg_id = content_msg.id;
+
+    var release = await download_lock.acquire();
+    try {
+        const buffer = await bot.getMessageContent(msg_id);
+        if (buffer && (buffer.length > 256)) {
+            // Upload content to Google Photo
+            var upload_item = {
+                "name": `${msg_type}-${msg_id}`,
+                "album_id" : album_id,
+                "stream": streamifier.createReadStream(buffer)
+            };
+
+            enqueue_upload_item(upload_item);
+            logger.info(`Download media content success: ${msg_type}-${msg_id} (size: ${buffer.length})`);
+        } else {
+            let need_retry = true;
+            if (buffer) {
+                try {
+                    // if buffer content is error message, we should retry downloading again later
+                    JSON.parse(buffer.toString());
+                    logger.warn(`Get error message when downloading: ${msg_type}-${msg_id}: ${buffer.toString()}`);
+                } catch (err) {
+                    // buffer is not a JSON object, we should treat it as normal content
+                    need_retry = false;
+                    enqueue_upload_item(upload_item);
+                    logger.info(`Download media content success: ${msg_type}-${msg_id} (size: ${buffer.length})`);
+                }
+            }
+
+            if (need_retry) {
+                if (content_msg.retry_count < max_retry) {
+                    content_msg.retry_count++;
+                    enqueue_content_msg(content_msg);
+                    logger.warn(`Failed to download content, will retry again: ${msg_type}-${msg_id}`);
+                } else {
+                    logger.error(`Failed to download content, stop retry: ${msg_type}-${msg_id}`);
+                }
+            }
+        }
+    } catch(err) {
+        logger.error("Failed to download content due to exception:", err);
+    }
+
+    release();
+}
 
 const linebotParser = bot.parser();
 
@@ -385,40 +632,6 @@ function handle_text_message(text) {
     return null;
 }
 
-function sleep_random(min, max){
-    return new Promise(resolve => {
-        var seconds = Math.floor(Math.random() * (max-min)) + min;
-        setTimeout(resolve, seconds * 1000);
-    });
-}
-
-async function upload_to_google_photo(type, msg_id) {
-    const buffer = await bot.getMessageContent(msg_id);
-
-    var item = {
-        "name": `${type}-${msg_id}`,
-        "stream": streamifier.createReadStream(buffer)
-    };
-
-    logger.info('Start uploading content to Google Photo:', item.name);
-
-    // Upload content to Google Photo
-    // TODO(james): query album id from database according to group ID or room ID
-    const token = await get_access_token();
-    var retry = 3;
-    do {
-        var error = await upload_media_item(token, default_album_id, item);
-        if (error) {
-            retry--;
-            await sleep_random(10, 30);
-            logger.error(`Failed to upload file to album, retry count left: ${retry}`, error);
-        } else {
-            logger.info(`Upload media item success: ${item.name}`);
-            break;
-        }
-    } while (retry > 0);
-}
-
 bot.on('message', function(event) {
     var reply_message = null;
 
@@ -429,22 +642,25 @@ bot.on('message', function(event) {
         case "image":
         case "video":
             if (event.message.contentProvider.type === "line") {
-                upload_to_google_photo(event.message.type, event.message.id);
+                let content_msg = {
+                    "id": event.message.id,
+                    "type": event.message.type,
+                    "source": event.source
+                };
+                enqueue_content_msg(content_msg);
             }
             break;
         default:
             logger.error('Unkown message type', event.message.type);
     }
 
-    if (reply_message === null) {
-        return;
+    if (reply_message) {
+        event.reply(reply_message).then(function(data) {
+            logger.debug('Success to reply message event');
+        }).catch(function(error) {
+            logger.error('Failed to reply message event', error);
+        });
     }
-
-    event.reply(reply_message).then(function(data) {
-        logger.debug('Success to reply message event');
-    }).catch(function(error) {
-        logger.error('Failed to reply message event', error);
-    });
 });
 
 //Express API --------- App.get('path', callback function);
